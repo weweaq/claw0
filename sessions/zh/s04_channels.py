@@ -27,9 +27,17 @@ from anthropic import Anthropic
 
 try:
     import httpx
+
     HAS_HTTPX = True
 except ImportError:
     HAS_HTTPX = False
+
+try:
+    import lark_oapi as lark
+
+    HAS_LARK = True
+except ImportError:
+    HAS_LARK = False
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -63,14 +71,18 @@ def print_assistant(text: str, ch: str = "cli") -> None:
     prefix = f"[{ch}] " if ch != "cli" else ""
     print(f"\n{GREEN}{BOLD}Assistant:{RESET} {prefix}{text}\n")
 
+
 def print_tool(name: str, detail: str) -> None:
     print(f"  {DIM}[tool: {name}] {detail}{RESET}")
+
 
 def print_info(text: str) -> None:
     print(f"{DIM}{text}{RESET}")
 
+
 def print_channel(text: str) -> None:
     print(f"{BLUE}{text}{RESET}")
+
 
 # ---------------------------------------------------------------------------
 # 数据结构
@@ -88,6 +100,7 @@ class InboundMessage:
     media: list = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
+
 @dataclass
 class ChannelAccount:
     """每个 bot 的配置。同一通道类型可以运行多个 bot。"""
@@ -96,12 +109,14 @@ class ChannelAccount:
     token: str = ""
     config: dict = field(default_factory=dict)
 
+
 # ---------------------------------------------------------------------------
 # 会话键
 # ---------------------------------------------------------------------------
 
 def build_session_key(channel: str, account_id: str, peer_id: str) -> str:
     return f"agent:main:direct:{channel}:{peer_id}"
+
 
 # ---------------------------------------------------------------------------
 # Channel 抽象基类
@@ -118,6 +133,7 @@ class Channel(ABC):
 
     def close(self) -> None:
         pass
+
 
 # ---------------------------------------------------------------------------
 # CLIChannel
@@ -145,6 +161,7 @@ class CLIChannel(Channel):
         print_assistant(text)
         return True
 
+
 # ---------------------------------------------------------------------------
 # 偏移量持久化 -- 两个简单函数
 # ---------------------------------------------------------------------------
@@ -153,11 +170,13 @@ def save_offset(path: Path, offset: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(offset))
 
+
 def load_offset(path: Path) -> int:
     try:
         return int(path.read_text().strip())
     except Exception:
         return 0
+
 
 # ---------------------------------------------------------------------------
 # TelegramChannel -- Bot API 长轮询
@@ -256,7 +275,9 @@ class TelegramChannel(Channel):
                 for mt in ("photo", "video", "document", "audio"):
                     if mt in m:
                         raw_m = m[mt]
-                        fid = raw_m[-1]["file_id"] if isinstance(raw_m, list) and raw_m else raw_m.get("file_id", "") if isinstance(raw_m, dict) else ""
+                        fid = raw_m[-1]["file_id"] if isinstance(raw_m, list) and raw_m else raw_m.get("file_id",
+                                                                                                       "") if isinstance(
+                            raw_m, dict) else ""
                         media_items.append({"type": mt, "file_id": fid})
             inbound = self._parse(entries[0][0], entries[0][1])
             if inbound:
@@ -338,7 +359,8 @@ class TelegramChannel(Channel):
         chunks = []
         while text:
             if len(text) <= self.MAX_MSG_LEN:
-                chunks.append(text); break
+                chunks.append(text);
+                break
             cut = text.rfind("\n", 0, self.MAX_MSG_LEN)
             if cut <= 0:
                 cut = self.MAX_MSG_LEN
@@ -349,6 +371,7 @@ class TelegramChannel(Channel):
     def close(self) -> None:
         self._http.close()
 
+
 # ---------------------------------------------------------------------------
 # FeishuChannel -- 基于 webhook (飞书/Lark)
 # ---------------------------------------------------------------------------
@@ -357,19 +380,105 @@ class FeishuChannel(Channel):
     name = "feishu"
 
     def __init__(self, account: ChannelAccount) -> None:
-        if not HAS_HTTPX:
-            raise RuntimeError("FeishuChannel requires httpx: pip install httpx")
         self.account_id = account.account_id
         self.app_id = account.config.get("app_id", "")
         self.app_secret = account.config.get("app_secret", "")
-        self._encrypt_key = account.config.get("encrypt_key", "")
-        self._bot_open_id = account.config.get("bot_open_id", "")
         is_lark = account.config.get("is_lark", False)
         self.api_base = ("https://open.larksuite.com/open-apis" if is_lark
                          else "https://open.feishu.cn/open-apis")
         self._tenant_token: str = ""
         self._token_expires_at: float = 0.0
+        self._use_ws = account.config.get("use_ws", False) and HAS_LARK
         self._http = httpx.Client(timeout=15.0)
+        self._message_queue: list[InboundMessage] = []
+        self._queue_lock = threading.Lock()
+        self._ws_client: lark.ws.Client | None = None
+        self._ws_thread: threading.Thread | None = None
+
+    def start_ws(self) -> None:
+        if not self._use_ws:
+            return
+        event_handler = (
+            lark.EventDispatcherHandler.builder("", "")
+            .register_p2_im_message_receive_v1(self._on_ws_message)
+            .build()
+        )
+        self._ws_client = lark.ws.Client(
+            self.app_id, self.app_secret,
+            event_handler=event_handler,
+            log_level=lark.LogLevel.ERROR,
+        )
+        self._ws_thread = threading.Thread(target=self._run_ws, daemon=True)
+        self._ws_thread.start()
+        print_channel("  [feishu] WebSocket client started")
+
+    def _run_ws(self) -> None:
+        try:
+            self._ws_client.start()
+        except Exception as e:
+            print(f"  {RED}[feishu] WebSocket error: {e}{RESET}")
+
+    def _on_ws_message(self, data: lark.im.v1.P2ImMessageReceiveV1) -> None:
+        try:
+            event = data.event
+            message = event.message
+            sender_id = event.sender.sender_id.open_id or event.sender.sender_id.user_id or "unknown"
+            chat_id = message.chat_id
+            chat_type = message.chat_type
+            msg_type = message.message_type
+            is_group = chat_type == "group"
+
+            content_str = message.content or "{}"
+            try:
+                content = json.loads(content_str) if isinstance(content_str, str) else content_str
+            except json.JSONDecodeError:
+                content = {}
+
+            text = ""
+            media: list[dict] = []
+            if msg_type == "text":
+                text = content.get("text", "")
+            elif msg_type == "post":
+                texts: list[str] = []
+                for lc in content.values():
+                    if not isinstance(lc, dict):
+                        continue
+                    title = lc.get("title", "")
+                    if title:
+                        texts.append(title)
+                    for para in lc.get("content", []):
+                        for node in para:
+                            if node.get("tag") == "text":
+                                texts.append(node.get("text", ""))
+                text = "\n".join(texts)
+            elif msg_type == "image":
+                key = content.get("image_key", "")
+                if key:
+                    media.append({"type": "image", "key": key})
+                text = "[image]"
+            else:
+                text = f"[{msg_type}]"
+
+            if not text:
+                return
+
+            inbound = InboundMessage(
+                text=text, sender_id=sender_id, channel="feishu",
+                account_id=self.account_id,
+                peer_id=sender_id if chat_type == "p2p" else chat_id,
+                is_group=is_group, media=media,
+                raw={
+                    "message_id": message.message_id,
+                    "chat_id": chat_id,
+                    "msg_type": msg_type,
+                    "event": data.dict() if hasattr(data, "dict") else {},
+                },
+            )
+            with self._queue_lock:
+                self._message_queue.append(inbound)
+            print_channel(f"[feishu] Received from {sender_id}: {text[:80]}")
+        except Exception as e:
+            print(f"  {RED}[feishu] Parse error: {e}{RESET}")
 
     def _refresh_token(self) -> str:
         if self._tenant_token and time.time() < self._token_expires_at:
@@ -390,93 +499,23 @@ class FeishuChannel(Channel):
             print(f"  {RED}[feishu] Token error: {exc}{RESET}")
             return ""
 
-    def _bot_mentioned(self, event: dict) -> bool:
-        for m in event.get("message", {}).get("mentions", []):
-            mid = m.get("id", {})
-            if isinstance(mid, dict) and mid.get("open_id") == self._bot_open_id:
-                return True
-            if isinstance(mid, str) and mid == self._bot_open_id:
-                return True
-            if m.get("key") == self._bot_open_id:
-                return True
-        return False
-
-    def _parse_content(self, message: dict) -> tuple[str, list]:
-        msg_type = message.get("msg_type", "text")
-        raw = message.get("content", "{}")
-        try:
-            content = json.loads(raw) if isinstance(raw, str) else raw
-        except json.JSONDecodeError:
-            return "", []
-
-        media: list[dict] = []
-        if msg_type == "text":
-            return content.get("text", ""), media
-        if msg_type == "post":
-            texts: list[str] = []
-            for lc in content.values():
-                if not isinstance(lc, dict):
-                    continue
-                title = lc.get("title", "")
-                if title:
-                    texts.append(title)
-                for para in lc.get("content", []):
-                    for node in para:
-                        tag = node.get("tag")
-                        if tag == "text":
-                            texts.append(node.get("text", ""))
-                        elif tag == "a":
-                            texts.append(node.get("text", "") + " " + node.get("href", ""))
-            return "\n".join(texts), media
-        if msg_type == "image":
-            key = content.get("image_key", "")
-            if key:
-                media.append({"type": "image", "key": key})
-            return "[image]", media
-        return "", media
-
-    def parse_event(self, payload: dict, token: str = "") -> InboundMessage | None:
-        """解析飞书事件回调。使用简单的 token 校验进行验证。"""
-        if self._encrypt_key and token and token != self._encrypt_key:
-            print(f"  {RED}[feishu] Token verification failed{RESET}")
-            return None
-        if "challenge" in payload:
-            print_info(f"[feishu] Challenge: {payload['challenge']}")
-            return None
-
-        event = payload.get("event", {})
-        message = event.get("message", {})
-        sender = event.get("sender", {}).get("sender_id", {})
-        user_id = sender.get("open_id", sender.get("user_id", ""))
-        chat_id = message.get("chat_id", "")
-        chat_type = message.get("chat_type", "")
-        is_group = chat_type == "group"
-
-        if is_group and self._bot_open_id and not self._bot_mentioned(event):
-            return None
-
-        text, media = self._parse_content(message)
-        if not text:
-            return None
-
-        return InboundMessage(
-            text=text, sender_id=user_id, channel="feishu",
-            account_id=self.account_id,
-            peer_id=user_id if chat_type == "p2p" else chat_id,
-            media=media, is_group=is_group, raw=payload,
-        )
-
     def receive(self) -> InboundMessage | None:
+        if not self._use_ws:
+            return None
+        with self._queue_lock:
+            if self._message_queue:
+                return self._message_queue.pop(0)
         return None
 
     def send(self, to: str, text: str, **kwargs: Any) -> bool:
         token = self._refresh_token()
         if not token:
             return False
+        receive_id_type = kwargs.get("receive_id_type", "open_id")
         try:
             resp = self._http.post(
                 f"{self.api_base}/im/v1/messages",
-                params={"receive_id_type": "chat_id"},
+                params={"receive_id_type": receive_id_type},
                 headers={"Authorization": f"Bearer {token}"},
                 json={"receive_id": to, "msg_type": "text",
                       "content": json.dumps({"text": text})},
@@ -508,6 +547,7 @@ def tool_memory_write(content: str) -> str:
     except Exception as exc:
         return f"Error: {exc}"
 
+
 def tool_memory_search(query: str) -> str:
     print_tool("memory_search", query)
     if not MEMORY_FILE.exists():
@@ -519,11 +559,12 @@ def tool_memory_search(query: str) -> str:
     except Exception as exc:
         return f"Error: {exc}"
 
+
 TOOLS = [
     {"name": "memory_write", "description": "Save a note to long-term memory.",
      "input_schema": {"type": "object", "required": ["content"],
                       "properties": {"content": {"type": "string",
-                                                  "description": "The text to remember."}}}},
+                                                 "description": "The text to remember."}}}},
     {"name": "memory_search", "description": "Search through saved memory notes.",
      "input_schema": {"type": "object", "required": ["query"],
                       "properties": {"query": {"type": "string",
@@ -535,6 +576,7 @@ TOOL_HANDLERS: dict[str, Any] = {
     "memory_search": tool_memory_search,
 }
 
+
 def process_tool_call(tool_name: str, tool_input: dict) -> str:
     handler = TOOL_HANDLERS.get(tool_name)
     if not handler:
@@ -543,6 +585,7 @@ def process_tool_call(tool_name: str, tool_input: dict) -> str:
         return handler(**tool_input)
     except Exception as exc:
         return f"Error: {tool_name} failed: {exc}"
+
 
 # ---------------------------------------------------------------------------
 # ChannelManager
@@ -567,12 +610,13 @@ class ChannelManager:
         for ch in self.channels.values():
             ch.close()
 
+
 # ---------------------------------------------------------------------------
 # Telegram 后台轮询线程
 # ---------------------------------------------------------------------------
 
 def telegram_poll_loop(
-    tg: TelegramChannel, queue: list, lock: threading.Lock, stop: threading.Event,
+        tg: TelegramChannel, queue: list, lock: threading.Lock, stop: threading.Event,
 ) -> None:
     print_channel(f"  [telegram] Polling started for {tg.account_id}")
     while not stop.is_set():
@@ -584,6 +628,7 @@ def telegram_poll_loop(
         except Exception as exc:
             print(f"  {RED}[telegram] Poll error: {exc}{RESET}")
             stop.wait(5.0)
+
 
 # ---------------------------------------------------------------------------
 # REPL 命令
@@ -605,14 +650,15 @@ def handle_repl_command(cmd: str, mgr: ChannelManager) -> bool:
         return True
     return False
 
+
 # ---------------------------------------------------------------------------
 # Agent 回合
 # ---------------------------------------------------------------------------
 
 def run_agent_turn(
-    inbound: InboundMessage,
-    conversations: dict[str, list[dict]],
-    mgr: ChannelManager,
+        inbound: InboundMessage,
+        conversations: dict[str, list[dict]],
+        mgr: ChannelManager,
 ) -> None:
     sk = build_session_key(inbound.channel, inbound.account_id, inbound.peer_id)
     if sk not in conversations:
@@ -646,7 +692,8 @@ def run_agent_turn(
             if text:
                 ch = mgr.get(inbound.channel)
                 if ch:
-                    ch.send(inbound.peer_id, text)
+                    ch.send(inbound.peer_id, text,
+                            receive_id_type="chat_id" if inbound.is_group else "open_id")
                 else:
                     print_assistant(text, inbound.channel)
             break
@@ -664,8 +711,10 @@ def run_agent_turn(
             if text:
                 ch = mgr.get(inbound.channel)
                 if ch:
-                    ch.send(inbound.peer_id, text)
+                    ch.send(inbound.peer_id, text,
+                            receive_id_type="chat_id" if inbound.is_group else "open_id")
             break
+
 
 # ---------------------------------------------------------------------------
 # 主循环
@@ -697,20 +746,25 @@ def agent_loop() -> None:
         )
         tg_thread.start()
 
+    fs_channel: FeishuChannel | None = None
     fs_id = os.getenv("FEISHU_APP_ID", "").strip()
     fs_secret = os.getenv("FEISHU_APP_SECRET", "").strip()
-    if fs_id and fs_secret and HAS_HTTPX:
-        fs_acc = ChannelAccount(
-            channel="feishu", account_id="feishu-primary",
-            config={
-                "app_id": fs_id, "app_secret": fs_secret,
-                "encrypt_key": os.getenv("FEISHU_ENCRYPT_KEY", ""),
-                "bot_open_id": os.getenv("FEISHU_BOT_OPEN_ID", ""),
-                "is_lark": os.getenv("FEISHU_IS_LARK", "").lower() in ("1", "true"),
-            },
-        )
-        mgr.accounts.append(fs_acc)
-        mgr.register(FeishuChannel(fs_acc))
+    if fs_id and fs_secret:
+        use_ws = HAS_LARK
+        if use_ws or HAS_HTTPX:
+            fs_acc = ChannelAccount(
+                channel="feishu", account_id="feishu-primary",
+                config={
+                    "app_id": fs_id, "app_secret": fs_secret,
+                    "is_lark": os.getenv("FEISHU_IS_LARK", "").lower() in ("1", "true"),
+                    "use_ws": use_ws,
+                },
+            )
+            mgr.accounts.append(fs_acc)
+            fs_channel = FeishuChannel(fs_acc)
+            mgr.register(fs_channel)
+            if use_ws:
+                fs_channel.start_ws()
 
     print_info("=" * 60)
     print_info("  claw0  |  Section 04: Channels")
@@ -722,6 +776,37 @@ def agent_loop() -> None:
 
     conversations: dict[str, list[dict]] = {}
 
+    def handle_cli_input(user_input: str) -> bool:
+        """处理一条CLI输入。返回True表示继续循环，False表示退出。"""
+        if user_input.lower() in ("quit", "exit"):
+            return False
+        if user_input.startswith("/") and handle_repl_command(user_input, mgr):
+            return True
+        run_agent_turn(
+            InboundMessage(text=user_input, sender_id="cli-user",
+                           channel="cli", account_id="cli-local", peer_id="cli-user"),
+            conversations, mgr,
+        )
+        return True
+
+    cli_input_queue: list[str] = []
+    cli_stop = threading.Event()
+
+    def cli_input_loop() -> None:
+        while not cli_stop.is_set():
+            try:
+                line = input(f"{CYAN}{BOLD}You > {RESET}")
+                with q_lock:
+                    cli_input_queue.append(line)
+            except (KeyboardInterrupt, EOFError):
+                cli_stop.set()
+                break
+
+    cli_thread: threading.Thread | None = None
+    if tg_channel or (fs_channel and fs_channel._use_ws):
+        cli_thread = threading.Thread(target=cli_input_loop, daemon=True)
+        cli_thread.start()
+
     while True:
         # 排空 Telegram 队列
         with q_lock:
@@ -731,39 +816,42 @@ def agent_loop() -> None:
             print_channel(f"\n  [telegram] {m.sender_id}: {m.text[:80]}")
             run_agent_turn(m, conversations, mgr)
 
-        # CLI 输入 (当 Telegram 活跃时使用非阻塞模式)
-        if tg_channel:
-            import select
-            if not select.select([sys.stdin], [], [], 0.5)[0]:
-                continue
-            try:
-                user_input = sys.stdin.readline().strip()
-            except (KeyboardInterrupt, EOFError):
+        # 排空 Feishu WebSocket 队列
+        if fs_channel and fs_channel._use_ws:
+            while True:
+                fs_msg = fs_channel.receive()
+                if not fs_msg:
+                    break
+                print_channel(f"\n  [feishu] {fs_msg.sender_id}: {fs_msg.text[:80]}")
+                run_agent_turn(fs_msg, conversations, mgr)
+
+        # 排空 CLI 输入队列
+        with q_lock:
+            cli_inputs = cli_input_queue[:]
+            cli_input_queue.clear()
+        for user_input in cli_inputs:
+            if not handle_cli_input(user_input):
+                cli_stop.set()
                 break
-            if not user_input:
-                continue
-        else:
+        if cli_stop.is_set():
+            break
+
+        # 无后台通道时使用阻塞输入
+        if not (tg_channel or (fs_channel and fs_channel._use_ws)):
             msg = cli.receive()
             if msg is None:
                 break
-            user_input = msg.text
-
-        if user_input.lower() in ("quit", "exit"):
-            break
-        if user_input.startswith("/") and handle_repl_command(user_input, mgr):
-            continue
-
-        run_agent_turn(
-            InboundMessage(text=user_input, sender_id="cli-user",
-                           channel="cli", account_id="cli-local", peer_id="cli-user"),
-            conversations, mgr,
-        )
+            if not handle_cli_input(msg.text):
+                break
+        else:
+            stop_event.wait(0.3)
 
     print(f"{DIM}Goodbye.{RESET}")
     stop_event.set()
     if tg_thread and tg_thread.is_alive():
         tg_thread.join(timeout=3.0)
     mgr.close_all()
+
 
 # ---------------------------------------------------------------------------
 # 入口
@@ -775,6 +863,7 @@ def main() -> None:
         print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
         sys.exit(1)
     agent_loop()
+
 
 if __name__ == "__main__":
     main()
